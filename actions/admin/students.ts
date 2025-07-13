@@ -107,18 +107,19 @@ export const handleStudentPayment = async (
         ); // Throw error for toast.promise to catch
       }
 
-      // // 4. Check if the payment completes the course fee and distribute commission if so
-      // if (newTotalAmount === coursePaymentValue) {
-      //   const commissionResult = await distributeCommission({
-      //     studentId: studentid,
-      //     paymentId: insertedPaymentId,
-      //   });
+      // 4. Check if the payment completes the course fee and distribute commission if so
+      if (newTotalAmount === coursePaymentValue) {
+        const commissionResult = await distributeCommission({
+          tx, // Pass the transaction object
+          studentId: studentid,
+          paymentId: insertedPaymentId,
+        });
 
-      //   if (!commissionResult.success) {
-      //     throw new Error(commissionResult.message);
-      //   }
-      // }
-
+        if (!commissionResult.success) {
+          // Propagate the specific error message from distributeCommission
+          throw new Error(commissionResult.message);
+        }
+      }
 
       // Revalidate cache for affected paths after successful transaction
       revalidatePath("/admin/students");

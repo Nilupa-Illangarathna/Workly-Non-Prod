@@ -10,7 +10,6 @@ import {
 } from "@/drizzle/schema";
 import { PgTransaction } from "drizzle-orm/pg-core"; // Import necessary Drizzle types
 import { PostgresJsQueryResultHKT } from "drizzle-orm/postgres-js";
-import { db } from "@/drizzle/db"; // Import your DB instance
 
 // Define the type for the transaction object for better type safety
 type DBTransaction = PgTransaction<
@@ -106,133 +105,159 @@ const getCommissionChain = async (
  * Distributes commission to partners based on the referral chain and predefined pools.
  * This function should be called within a larger transaction.
  */
-
 export const distributeCommission = async ({
+  tx, // The transaction object from the calling function
   studentId,
   paymentId,
 }: {
+  tx: DBTransaction;
   studentId: string;
   paymentId?: string;
 }) => {
   try {
-    console.log("🟡 Starting commission distribution...");
+    const currentPaymentId = paymentId; // Use a mutable variable for paymentId
 
-    if (!paymentId) {
-      console.error("❌ Missing payment ID");
+    // 1). Ensure user status is 'approved' (idempotent: only updates if pending)
+    const user = await tx
+      .select({ status: users.status })
+      .from(users)
+      .where(eq(users.id, studentId));
+
+    if (user.length === 0) {
+      throw new Error("Student not found for commission distribution.");
+    }
+
+    if (user[0]?.status === "pending") {
+      await tx
+        .update(users)
+        .set({ status: "approved", updatedat: new Date() })
+        .where(eq(users.id, studentId));
+    }
+
+    // Ensure paymentId is available for earning records
+    if (!currentPaymentId) {
       throw new Error("Payment ID is missing for commission distribution.");
     }
 
-    console.log(`➡️ Student ID: ${studentId}`);
-    console.log(`➡️ Payment ID: ${paymentId}`);
+    // 3) Load the three distribution pools (using the passed 'tx' object)
+    const [totalPoolResult, topPoolResult, subPoolResult] = await Promise.all([
+      tx
+        .select({ amount: commission_distributions.amount })
+        .from(commission_distributions)
+        .where(eq(commission_distributions.category, "total_commission")),
+      tx
+        .select({ amount: commission_distributions.amount })
+        .from(commission_distributions)
+        .where(eq(commission_distributions.category, "top_managers")),
+      tx
+        .select({ amount: commission_distributions.amount })
+        .from(commission_distributions)
+        .where(eq(commission_distributions.category, "sub_company")),
+    ]);
 
-    return await db.transaction(async (tx) => {
-      const currentPaymentId = paymentId;
+    // Parse pool amounts, defaulting to 0 if not found
+    const totalPoolAmount = parseFloat(totalPoolResult[0]?.amount || "0");
+    const topPoolAmount = parseFloat(topPoolResult[0]?.amount || "0");
+    const subPoolAmount = parseFloat(subPoolResult[0]?.amount || "0");
 
-      // 1). Ensure user status is 'approved'
-      const user = await tx
-        .select({ status: users.status })
-        .from(users)
-        .where(eq(users.id, studentId));
+    // 4) Build the referral chain
+    const chain = await getCommissionChain(tx, studentId);
 
-      if (user.length === 0) {
-        console.error("❌ Student not found");
-        throw new Error("Student not found for commission distribution.");
+    // Filter out level 0 (Top Manager) from the sub-chain if they are included in the chain
+    // The recursive CTE might include the direct referrer regardless of level.
+    // The top managers are handled separately in step 5.
+    const subChain = chain
+      .filter((p) => p.level > 0)
+      .sort((a, b) => a.level - b.level); // Ensure ascending order by level for correct distribution logic
+
+    const hasReferral = subChain.length > 0;
+
+    // 5) Distribute to ALL Top Managers (level 0 partners)
+    const topManagers = await tx
+      .select()
+      .from(partners)
+      .where(eq(partners.level, 0));
+
+    // Determine the base amount for top managers based on referral presence
+    const baseTopAmount = hasReferral ? topPoolAmount : totalPoolAmount;
+
+    for (const mgr of topManagers) {
+      const rate = Number(mgr.commissionrate) / 100;
+      const calculatedAmount = rate * baseTopAmount;
+      const amt = parseFloat(calculatedAmount.toFixed(2)); // Round to 2 decimal places for currency
+
+      if (amt > 0) {
+        await creditPartner(
+          tx,
+          mgr.userid!,
+          amt,
+          studentId,
+          currentPaymentId,
+          mgr.level
+        );
       }
+    }
 
-      if (user[0]?.status === "pending") {
-        console.log("🟢 Approving pending student...");
-        await tx
-          .update(users)
-          .set({ status: "approved", updatedat: new Date() })
-          .where(eq(users.id, studentId));
-      }
+    // 6) Distribute to Developers (hardcoded developer ID and fixed amount)
+    // Consider making the developer ID and amount configurable if they can change
+    await creditPartner(
+      tx,
+      "d56a1e10-40a3-4730-b903-9afde580de74", // Developer User ID
+      300, // Fixed amount for developer
+      studentId,
+      currentPaymentId,
+      -1 // Custom level for developer for role mapping
+    );
 
-      // 2). Load the three distribution pools
-      console.log("🔄 Fetching commission pools...");
-      const [totalPoolResult, topPoolResult, subPoolResult] = await Promise.all([
-        tx.select({ amount: commission_distributions.amount })
-          .from(commission_distributions)
-          .where(eq(commission_distributions.category, "total_commission")),
-        tx.select({ amount: commission_distributions.amount })
-          .from(commission_distributions)
-          .where(eq(commission_distributions.category, "top_managers")),
-        tx.select({ amount: commission_distributions.amount })
-          .from(commission_distributions)
-          .where(eq(commission_distributions.category, "sub_company")),
-      ]);
+    // 7) If there IS a referral chain (sub-company and below), distribute subPool down it
+    if (hasReferral) {
+      for (let i = 0; i < subChain.length; i++) {
+        const currentPartnerInChain = subChain[i];
+        let amountToCredit: number;
 
-      const totalPoolAmount = parseFloat(totalPoolResult[0]?.amount || "0");
-      const topPoolAmount = parseFloat(topPoolResult[0]?.amount || "0");
-      const subPoolAmount = parseFloat(subPoolResult[0]?.amount || "0");
+        const currentPartnerRate = Number(currentPartnerInChain.commissionrate);
 
-      console.log(`📊 Pool amounts: total=${totalPoolAmount}, top=${topPoolAmount}, sub=${subPoolAmount}`);
-
-      // 3) Build the referral chain
-      console.log("🔗 Building referral chain...");
-      const chain = await getCommissionChain(tx, studentId);
-      const subChain = chain.filter((p) => p.level > 0).sort((a, b) => a.level - b.level);
-      const hasReferral = subChain.length > 0;
-      console.log(`🔗 Referral chain found: ${hasReferral} (${subChain.length} members)`);
-
-      // 4) Distribute to ALL Top Managers
-      const topManagers = await tx.select().from(partners).where(eq(partners.level, 0));
-      const baseTopAmount = hasReferral ? topPoolAmount : totalPoolAmount;
-
-      console.log(`💸 Distributing to ${topManagers.length} top managers...`);
-      for (const mgr of topManagers) {
-        const rate = Number(mgr.commissionrate) / 100;
-        const amt = parseFloat((rate * baseTopAmount).toFixed(2));
-        console.log(`➡️ Top Manager [${mgr.userid}] earns ${amt} (rate: ${rate * 100}%)`);
-        if (amt > 0) {
-          await creditPartner(tx, mgr.userid!, amt, studentId, currentPaymentId, mgr.level);
-        }
-      }
-
-      // 5) Distribute to Developers
-      console.log("💻 Crediting developer account with fixed 300...");
-      await creditPartner(
-        tx,
-        "d56a1e10-40a3-4730-b903-9afde580de74",
-        300,
-        studentId,
-        currentPaymentId,
-        -1
-      );
-
-      // 6) Distribute to Referral Chain (if exists)
-      if (hasReferral) {
-        console.log("🔁 Distributing to referral chain...");
-        for (let i = 0; i < subChain.length; i++) {
-          const partner = subChain[i];
-          let amountToCredit: number;
-
-          const rate = Number(partner.commissionrate);
-
-          if (i === 0) {
-            amountToCredit =
-              subChain.length > 1
-                ? subPoolAmount - Number(subChain[i + 1].commissionrate)
-                : subPoolAmount;
-          } else if (i === subChain.length - 1) {
-            amountToCredit = rate;
+        if (i === 0) {
+          // This is the Sub-Company (level 1)
+          // It takes the subPool amount minus the rate for the *next* level if it exists
+          if (subChain.length > 1) {
+            const nextLevelRate = Number(subChain[i + 1].commissionrate);
+            amountToCredit = subPoolAmount - nextLevelRate;
           } else {
-            amountToCredit = rate - Number(subChain[i + 1].commissionrate);
+            // If only sub-company exists in the chain, it gets the full subPool
+            amountToCredit = subPoolAmount;
           }
+        } else if (i === subChain.length - 1) {
+          // This is the last partner in the chain, they get their full rate
+          amountToCredit = currentPartnerRate;
+        } else {
+          // Middle partners in the chain (Sub 1, Sub 2, etc.)
+          // They get their rate minus the rate of the next tier below them
+          const nextLevelRate = Number(subChain[i + 1].commissionrate);
+          amountToCredit = currentPartnerRate - nextLevelRate;
+        }
 
-          const amt = parseFloat(amountToCredit.toFixed(2));
-          console.log(`➡️ Referral [${partner.userid}] earns ${amt} (level: ${partner.level})`);
+        const amt = parseFloat(amountToCredit.toFixed(2)); // Round to 2 decimal places
 
-          if (amt > 0) {
-            await creditPartner(tx, partner.userid, amt, studentId, currentPaymentId, partner.level);
-          }
+        // Only credit partner if the calculated amount is greater than 0
+        if (amt > 0) {
+          await creditPartner(
+            tx,
+            currentPartnerInChain.userid,
+            amt,
+            studentId,
+            currentPaymentId,
+            currentPartnerInChain.level
+          );
         }
       }
+    }
 
-      console.log("✅ Commission distribution completed successfully.");
-      return { success: true, message: "Commission distributed successfully" };
-    });
+    return { success: true, message: "Commission distributed successfully" };
   } catch (err) {
-    console.error("❌ Commission distribution FAILED:", err);
-    return { success: false, message: (err as Error).message || "Unknown error" };
+    // Log the error for debugging
+    console.error("Internal commission distribution failed:", err);
+    // Re-throw the error to ensure the calling transaction is rolled back
+    throw err;
   }
 };
