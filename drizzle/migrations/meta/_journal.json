@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1741770086841,
+      "tag": "0000_flawless_doorman",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1742817453268,
+      "tag": "0001_icy_sersi",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1744805311682,
+      "tag": "0002_illegal_lockjaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1747109467879,
+      "tag": "0003_slim_ultimatum",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1747167846716,
+      "tag": "0004_noisy_landau",
+      "breakpoints": true
+    }
+  ]
+}
